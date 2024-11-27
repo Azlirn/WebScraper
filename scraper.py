@@ -33,8 +33,13 @@ def setup_logging(base_folder):
         # Get site name from base folder
         site_name = os.path.basename(base_folder)
         
+        # Create log file in scraped_sites folder
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        logs_dir = os.path.join(script_dir, 'scraped_sites', 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+        
         # Create log file name based on site
-        log_file = os.path.join(os.path.dirname(base_folder), f"{site_name}_scraper.log")
+        log_file = os.path.join(logs_dir, f"{site_name}_scraper.log")
         
         # Configure logging
         logging.basicConfig(
@@ -148,7 +153,7 @@ def clean_url(url):
         # Remove any leading @ or other invalid characters
         url = re.sub(r'^[@#]+', '', url)
         
-        # Remove anchor fragments (#content, #top, etc.)
+        # Remove anchor fragments (#content)
         url = url.split('#')[0]
         
         # Ensure proper protocol
@@ -162,18 +167,14 @@ def clean_url(url):
         # Handle the homepage specially
         if not path or path == 'index.html':
             return f"{parsed.scheme}://{parsed.netloc}"
-            
-        # Split path and get the last segment
-        path_parts = path.split('/')
         
-        # Remove .html if present in any part
-        path_parts = [p[:-5] if p.endswith('.html') else p for p in path_parts]
-        
-        # Create new path by joining all parts with hyphens
-        new_path = '-'.join(filter(None, path_parts))
+        # Check if this is a blog post URL (contains date pattern)
+        if re.match(r'\d{4}-\d{2}', path):
+            # For blog posts, try the /blog/ prefix
+            path = f"blog/{path}"
         
         # Reconstruct URL
-        url = f"{parsed.scheme}://{parsed.netloc}/{new_path}"
+        url = f"{parsed.scheme}://{parsed.netloc}/{path}"
         
         print_colored(f"Cleaned URL: {url}", Fore.BLUE, "info")
         return url
@@ -229,8 +230,12 @@ def create_directory(path):
     try:
         # Get absolute path to script directory
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        # Create full path
-        full_path = os.path.join(script_dir, path)
+        # Create scraped_sites parent folder
+        scraped_sites_dir = os.path.join(script_dir, 'scraped_sites')
+        os.makedirs(scraped_sites_dir, exist_ok=True)
+        
+        # Create full path within scraped_sites
+        full_path = os.path.join(scraped_sites_dir, path)
         
         # Create directory if it doesn't exist
         if not os.path.exists(full_path):
@@ -272,21 +277,27 @@ def get_path_from_url(url, base_folder):
         parsed = urlparse(url)
         path = parsed.path.strip('/')
         
-        # Handle the homepage (empty path or just /)
+        # Handle the homepage
         if not path:
             return os.path.join(base_folder, 'index.html')
         
-        # Split path and get the last segment
-        path_parts = path.split('/')
+        # For blog posts, maintain the blog directory structure
+        if re.match(r'blog/\d{4}-\d{2}', path) or re.match(r'\d{4}-\d{2}', path):
+            # Ensure blog posts go in the blog directory
+            if not path.startswith('blog/'):
+                path = f"blog/{path}"
+            
+            # Create the full path
+            full_path = os.path.join(base_folder, path)
+            if not full_path.endswith('.html'):
+                full_path += '.html'
+        else:
+            # For regular pages, keep them in the root
+            filename = path.replace('/', '-')
+            if not filename.endswith('.html'):
+                filename += '.html'
+            full_path = os.path.join(base_folder, filename)
         
-        # Join all parts with hyphens to create a flat structure
-        flat_path = '-'.join(filter(None, path_parts))
-        
-        # Add .html extension if not present
-        if not flat_path.endswith('.html'):
-            flat_path += '.html'
-        
-        full_path = os.path.join(base_folder, flat_path)
         print_colored(f"Creating path: {full_path}", Fore.BLUE, "info")
         return full_path
         
@@ -443,6 +454,10 @@ def download_file(url, base_folder, asset_type=None, website_map=None):
 
 def try_url_variations(session, base_url):
     """Try different variations of the URL to find the working one"""
+    # Parse the URL
+    parsed = urlparse(base_url)
+    path = parsed.path.strip('/')
+    
     variations = [
         base_url,                    # Original URL
         base_url.rstrip('.html'),    # Without .html
@@ -450,24 +465,46 @@ def try_url_variations(session, base_url):
         f"{base_url}/",              # With trailing slash
     ]
     
+    # If this looks like a blog post (has date pattern)
+    if re.match(r'\d{4}-\d{2}', path):
+        # Add variations with and without /blog/ prefix
+        blog_path = f"blog/{path}"
+        base_blog_url = f"{parsed.scheme}://{parsed.netloc}/{blog_path}"
+        variations.extend([
+            base_blog_url,
+            base_blog_url.rstrip('.html'),
+            f"{base_blog_url}.html",
+            f"{base_blog_url}/",
+        ])
+    
     for url in variations:
         try:
             print_colored(f"Trying URL: {url}", Fore.BLUE, "info")
             response = session.get(url, timeout=30, allow_redirects=True)
             
-            # Check if we got redirected
-            if response.history:
+            # Check if we got a successful response or a redirect
+            if response.status_code in [200, 301, 302, 307, 308]:
+                # If redirected, use the final URL
                 final_url = response.url
-                print_colored(f"Redirected to: {final_url}", Fore.YELLOW, "info")
+                if response.history:
+                    print_colored(f"Redirected to: {final_url}", Fore.YELLOW, "info")
                 return response, final_url
-            
-            # If the request was successful
-            if response.status_code == 200:
-                return response, url
                 
-        except Exception as e:
+        except RequestException as e:
+            print_colored(f"Failed to access {url}: {str(e)}", Fore.YELLOW, "warning")
             continue
             
+    # If no variations worked, try without path
+    try:
+        base_site = f"{parsed.scheme}://{parsed.netloc}"
+        print_colored(f"Trying base site: {base_site}", Fore.BLUE, "info")
+        response = session.get(base_site, timeout=30, allow_redirects=True)
+        if response.status_code == 200:
+            print_colored("Successfully accessed base site", Fore.GREEN, "success")
+            return response, base_site
+    except RequestException as e:
+        print_colored(f"Failed to access base site: {str(e)}", Fore.RED, "error")
+    
     return None, None
 
 def scrape_website(url, base_folder, depth=0, max_depth=3, visited=None, website_map=None):
@@ -669,8 +706,13 @@ def setup_logging(base_folder):
         # Get site name from base folder
         site_name = os.path.basename(base_folder)
         
+        # Create log file in scraped_sites folder
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        logs_dir = os.path.join(script_dir, 'scraped_sites', 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+        
         # Create log file name based on site
-        log_file = os.path.join(os.path.dirname(base_folder), f"{site_name}_scraper.log")
+        log_file = os.path.join(logs_dir, f"{site_name}_scraper.log")
         
         # Configure logging
         logging.basicConfig(
